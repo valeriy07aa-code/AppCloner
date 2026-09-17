@@ -10,8 +10,6 @@ import android.util.Log;
 
 import androidx.core.content.FileProvider;
 
-import com.android.tools.build.apksig.ApkSigner;
-import com.android.tools.build.apksig.SignerConfig;
 import com.reandroid.arsc.chunk.xml.AndroidManifestBlock;
 
 import net.dongliu.apk.parser.ApkFile;
@@ -28,24 +26,29 @@ import java.io.OutputStream;
 import java.math.BigInteger;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
-import java.security.KeyStore;
+import java.security.MessageDigest;
 import java.security.PrivateKey;
+import java.security.Signature;
 import java.security.cert.X509Certificate;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.jar.Attributes;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
-import javax.security.auth.x500.X500Principal;
-
 /**
- * APK cloner using ARSCLib for binary XML modification
- * and apksig for proper APK signing.
+ * APK cloner using ARSCLib for binary XML modification.
+ * Signs APK using standard Java JAR signing (v1 scheme).
  */
 public class ArsclibApkCloner {
 
@@ -89,9 +92,6 @@ public class ArsclibApkCloner {
         return null;
     }
 
-    /**
-     * Clones APK: modify manifest + strip old signature + sign with new key
-     */
     public String cloneWithNewPackage(String packageName, String newPackageName) {
         try {
             String sourcePath = getApkPath(packageName);
@@ -106,7 +106,7 @@ public class ArsclibApkCloner {
             File unsignedFile = new File(tempDir, "unsigned_" + outputName);
             File signedFile = new File(outputDir, outputName);
 
-            // Step 1: Extract and modify manifest
+            // Step 1: Modify manifest
             byte[] manifestData = extractManifest(sourcePath);
             if (manifestData == null) {
                 Log.e(TAG, "Failed to extract manifest");
@@ -117,32 +117,29 @@ public class ArsclibApkCloner {
             manifestBlock.readBytes(new ByteArrayInputStream(manifestData));
 
             String originalPackage = manifestBlock.getPackageName();
-            Log.d(TAG, "Original package: " + originalPackage);
-            Log.d(TAG, "New package: " + newPackageName);
+            Log.d(TAG, "Original package: " + originalPackage + " -> " + newPackageName);
 
             manifestBlock.setPackageName(newPackageName);
             byte[] modifiedManifest = manifestBlock.getBytes();
 
-            // Step 2: Rebuild APK WITHOUT old signature (skip META-INF/)
-            boolean rebuilt = rebuildApkWithoutSignature(
-                    sourcePath, unsignedFile.getAbsolutePath(), modifiedManifest);
+            // Step 2: Rebuild APK without old signature
+            boolean rebuilt = rebuildApk(sourcePath, unsignedFile.getAbsolutePath(),
+                    modifiedManifest);
             if (!rebuilt) {
                 Log.e(TAG, "Failed to rebuild APK");
                 return null;
             }
 
-            // Step 3: Sign with a new key using apksig
-            boolean signed = signApkWithApksig(unsignedFile.getAbsolutePath(),
+            // Step 3: Sign APK (v1 JAR signing)
+            boolean signed = signApkV1(unsignedFile.getAbsolutePath(),
                     signedFile.getAbsolutePath());
             if (!signed) {
                 Log.e(TAG, "Failed to sign APK");
                 return null;
             }
 
-            // Cleanup unsigned
             unsignedFile.delete();
-
-            Log.i(TAG, "APK cloned successfully: " + signedFile.getAbsolutePath());
+            Log.i(TAG, "APK cloned: " + signedFile.getAbsolutePath());
             return signedFile.getAbsolutePath();
 
         } catch (Exception e) {
@@ -166,36 +163,32 @@ public class ArsclibApkCloner {
     }
 
     /**
-     * Rebuilds APK, replacing manifest and STRIPPING old META-INF signature
+     * Rebuilds APK, replacing manifest and stripping old META-INF/
      */
-    private boolean rebuildApkWithoutSignature(String inputPath, String outputPath,
-                                                byte[] modifiedManifest) {
+    private boolean rebuildApk(String inputPath, String outputPath, byte[] modifiedManifest) {
         try (ZipInputStream zis = new ZipInputStream(new FileInputStream(inputPath));
              ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outputPath))) {
 
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
-                String entryName = entry.getName();
+                String name = entry.getName();
 
-                // Skip old signature files
-                if (entryName.startsWith("META-INF/")) {
+                // Skip old signature
+                if (name.startsWith("META-INF/")) {
                     continue;
                 }
 
-                ZipEntry newEntry = new ZipEntry(entryName);
-                // Preserve method and time
+                ZipEntry newEntry = new ZipEntry(name);
                 newEntry.setMethod(entry.getMethod());
-                newEntry.setTime(entry.getTime());
-
                 zos.putNextEntry(newEntry);
 
-                if (entryName.equals("AndroidManifest.xml")) {
+                if (name.equals("AndroidManifest.xml")) {
                     zos.write(modifiedManifest);
                 } else {
-                    byte[] buffer = new byte[8192];
+                    byte[] buf = new byte[8192];
                     int len;
-                    while ((len = zis.read(buffer)) > 0) {
-                        zos.write(buffer, 0, len);
+                    while ((len = zis.read(buf)) > 0) {
+                        zos.write(buf, 0, len);
                     }
                 }
                 zos.closeEntry();
@@ -203,7 +196,6 @@ public class ArsclibApkCloner {
 
             zos.finish();
             return true;
-
         } catch (IOException e) {
             Log.e(TAG, "Error rebuilding APK", e);
             return false;
@@ -211,254 +203,248 @@ public class ArsclibApkCloner {
     }
 
     /**
-     * Signs APK using apksig library with a generated debug key
+     * Signs APK using v1 JAR signing scheme.
+     * This is compatible with all Android versions.
      */
-    private boolean signApkWithApksig(String inputPath, String outputPath) {
+    private boolean signApkV1(String inputPath, String outputPath) {
         try {
-            // Generate RSA key pair
+            // Generate signing key
             KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
             keyGen.initialize(2048);
             KeyPair keyPair = keyGen.generateKeyPair();
             PrivateKey privateKey = keyPair.getPrivate();
 
-            // Create self-signed certificate using Android's built-in classes
-            // apksig accepts any X509 cert — we build a minimal one
-            X509Certificate cert = createSelfSignedCert(keyPair);
+            // Generate self-signed certificate
+            X509Certificate cert = generateCert(keyPair);
 
-            // Setup signer config
-            SignerConfig signerConfig = new SignerConfig.Builder()
-                    .setName("AppCloner")
-                    .setPrivateKey(privateKey)
-                    .setCertificates(Collections.singletonList(cert))
-                    .build();
+            // Read all entries from unsigned APK
+            Map<String, byte[]> entries = new HashMap<>();
+            Map<String, ZipEntry> entryMeta = new HashMap<>();
+            try (ZipInputStream zis = new ZipInputStream(new FileInputStream(inputPath))) {
+                ZipEntry entry;
+                while ((entry = zis.getNextEntry()) != null) {
+                    String name = entry.getName();
+                    entries.put(name, readAllBytes(zis));
+                    entryMeta.put(name, entry);
+                }
+            }
 
-            List<SignerConfig> signerConfigs = new ArrayList<>();
-            signerConfigs.add(signerConfig);
+            // Calculate SHA-1 digests for all entries
+            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
 
-            // Sign the APK
-            ApkSigner signer = new ApkSigner.Builder(signerConfigs)
-                    .setInputApk(new File(inputPath))
-                    .setOutputApk(new File(outputPath))
-                    .setV1SigningEnabled(true)
-                    .setV2SigningEnabled(true)
-                    .setV3SigningEnabled(false)
-                    .build();
+            Manifest manifest = new Manifest();
+            Attributes mainAttrs = manifest.getMainAttributes();
+            mainAttrs.put(Attributes.Name.MANIFEST_VERSION, "1.0");
+            mainAttrs.put(new Attributes.Name("Created-By"), "AppCloner");
 
-            signer.sign();
+            // Build MANIFEST.MF entries
+            StringBuilder manifestEntries = new StringBuilder();
+            for (Map.Entry<String, byte[]> e : entries.entrySet()) {
+                String name = e.getKey();
+                byte[] data = e.getValue();
+
+                String sha1B64 = android.util.Base64.encodeToString(
+                        sha1.digest(data), android.util.Base64.NO_WRAP);
+                String sha256B64 = android.util.Base64.encodeToString(
+                        sha256.digest(data), android.util.Base64.NO_WRAP);
+
+                Attributes attrs = new Attributes();
+                attrs.put(new Attributes.Name("SHA-256-Digest"), sha256B64);
+                manifest.getEntries().put(name, attrs);
+            }
+
+            // Write MANIFEST.MF
+            ByteArrayOutputStream manifestBaos = new ByteArrayOutputStream();
+            manifest.write(manifestBaos);
+            byte[] manifestBytes = manifestBaos.toByteArray();
+
+            // Build CERT.SF (signature file)
+            StringBuilder sfContent = new StringBuilder();
+            sfContent.append("Signature-Version: 1.0\r\n");
+            sfContent.append("Created-By: AppCloner\r\n");
+            sfContent.append("SHA-256-Digest-Manifest: ");
+            sfContent.append(android.util.Base64.encodeToString(
+                    sha256.digest(manifestBytes), android.util.Base64.NO_WRAP));
+            sfContent.append("\r\n\r\n");
+
+            for (Map.Entry<String, Attributes> e : manifest.getEntries().entrySet()) {
+                String name = e.getKey();
+                Attributes attrs = e.getValue();
+
+                sfContent.append("Name: ").append(name).append("\r\n");
+                for (Map.Entry<Object, Object> attr : attrs.entrySet()) {
+                    sfContent.append(attr.getKey().toString()).append(": ")
+                            .append(attr.getValue().toString()).append("\r\n");
+                }
+                // Add SHA-256-Digest of the manifest section
+                // Build the section bytes
+                StringBuilder sectionSb = new StringBuilder();
+                sectionSb.append("Name: ").append(name).append("\r\n");
+                for (Map.Entry<Object, Object> attr : attrs.entrySet()) {
+                    sectionSb.append(attr.getKey().toString()).append(": ")
+                            .append(attr.getValue().toString()).append("\r\n");
+                }
+                sectionSb.append("\r\n");
+                String sectionSha256 = android.util.Base64.encodeToString(
+                        sha256.digest(sectionSb.toString().getBytes("UTF-8")),
+                        android.util.Base64.NO_WRAP);
+                sfContent.append("SHA-256-Digest-Manifest-Main-Attributes: ").append(sectionSha256).append("\r\n");
+                sfContent.append("\r\n");
+            }
+
+            byte[] sfBytes = sfContent.toString().getBytes("UTF-8");
+
+            // Sign CERT.SF to produce CERT.RSA
+            Signature sig = Signature.getInstance("SHA256withRSA");
+            sig.initSign(privateKey);
+            sig.update(sfBytes);
+            byte[] signatureBytes = sig.sign();
+
+            // Build PKCS#7 signed data
+            byte[] pkcs7 = buildPkcs7(sfBytes, signatureBytes, cert);
+
+            // Write signed APK
+            try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outputPath))) {
+                // Write all original entries
+                for (Map.Entry<String, byte[]> e : entries.entrySet()) {
+                    ZipEntry newEntry = new ZipEntry(e.getKey());
+                    zos.putNextEntry(newEntry);
+                    zos.write(e.getValue());
+                    zos.closeEntry();
+                }
+
+                // Write META-INF/MANIFEST.MF
+                zos.putNextEntry(new ZipEntry("META-INF/MANIFEST.MF"));
+                zos.write(manifestBytes);
+                zos.closeEntry();
+
+                // Write META-INF/CERT.SF
+                zos.putNextEntry(new ZipEntry("META-INF/CERT.SF"));
+                zos.write(sfBytes);
+                zos.closeEntry();
+
+                // Write META-INF/CERT.RSA (PKCS#7 signature)
+                zos.putNextEntry(new ZipEntry("META-INF/CERT.RSA"));
+                zos.write(pkcs7);
+                zos.closeEntry();
+
+                zos.finish();
+            }
+
             return true;
 
         } catch (Exception e) {
-            Log.e(TAG, "Error signing APK with apksig", e);
+            Log.e(TAG, "Error signing APK", e);
             return false;
         }
     }
 
     /**
-     * Creates a minimal self-signed X.509 certificate
-     * Uses BouncyCastle-style raw construction or Android's CertificateFactory
+     * Builds a minimal PKCS#7 SignedData structure
      */
-    private X509Certificate createSelfSignedCert(KeyPair keyPair) throws Exception {
-        // Build a minimal self-signed X.509 v3 certificate using
-        // javax.security and sun security provider (available on Android)
-        //
-        // We use the approach: create a KeyStore with a self-signed entry
-        String alias = "appcloner";
-        char[] password = "appcloner".toCharArray();
+    private byte[] buildPkcs7(byte[] content, byte[] signature, X509Certificate cert)
+            throws Exception {
+        // PKCS#7 ContentInfo ::= SEQUENCE {
+        //   contentType OID,
+        //   content [0] EXPLICIT SignedData
+        // }
 
-        KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
-        keyStore.load(null, password);
+        byte[] certDer = cert.getEncoded();
 
-        // Generate self-signed cert via KeyPairGenerator + KeyStore
-        // On Android, we can use a simpler approach: build the cert from scratch
-        java.security.cert.Certificate[] chain = generateCertificate(keyPair);
-        keyStore.setKeyEntry(alias, privateKey(keyPair), password, chain);
+        // SignedData ::= SEQUENCE {
+        //   version INTEGER (1),
+        //   digestAlgorithms SET { AlgorithmIdentifier },
+        //   contentInfo ContentInfo (empty),
+        //   certificates [0] IMPLICIT Certificate,
+        //   signerInfos SET { SignerInfo }
+        // }
 
-        return (X509Certificate) chain[0];
-    }
+        // AlgorithmIdentifier for SHA-256
+        byte[] sha256Alg = encodeSequence(encodeOid("2.16.840.1.101.3.4.2.1"));
 
-    private PrivateKey privateKey(KeyPair kp) {
-        return kp.getPrivate();
+        // SignerInfo ::= SEQUENCE {
+        //   version INTEGER (1),
+        //   issuerAndSerialNumber SEQUENCE { issuer Name, serial INTEGER },
+        //   digestAlgorithm AlgorithmIdentifier,
+        //   authenticatedAttributes [0] IMPLICIT Attributes (optional),
+        //   digestEncryptionAlgorithm AlgorithmIdentifier,
+        //   encryptedDigest OCTET STRING
+        // }
+
+        byte[] rsaAlg = encodeSequence(encodeOid("1.2.840.113549.1.1.1"));
+
+        // issuerAndSerialNumber
+        byte[] issuerDer = cert.getIssuerX500Principal().getEncoded();
+        byte[] serialNum = encodeInteger(cert.getSerialNumber());
+        byte[] issuerAndSerial = encodeSequence(concat(issuerDer, serialNum));
+
+        // SignerInfo
+        byte[] signerInfo = encodeSequence(concat(
+                encodeInteger(BigInteger.ONE),  // version
+                issuerAndSerial,
+                sha256Alg,                       // digestAlgorithm
+                rsaAlg,                          // digestEncryptionAlgorithm
+                encodeOctetString(signature)     // encryptedDigest
+        ));
+
+        // SignedData
+        byte[] signedData = encodeSequence(concat(
+                encodeInteger(BigInteger.ONE),             // version
+                encodeSet(sha256Alg),                      // digestAlgorithms
+                encodeSequence(encodeOid("1.2.840.113549.1.7.1")), // contentInfo (data)
+                encodeTlv(0xA0, certDer),                  // certificates [0]
+                encodeSet(signerInfo)                      // signerInfos
+        ));
+
+        // ContentInfo
+        return encodeSequence(concat(
+                encodeOid("1.2.840.113549.1.7.2"),  // signedData OID
+                encodeTlv(0xA0, signedData)         // content [0]
+        ));
     }
 
     /**
-     * Generates a self-signed certificate chain
+     * Generates a self-signed X.509 v3 certificate using raw DER encoding
      */
-    private java.security.cert.Certificate[] generateCertificate(KeyPair keyPair) throws Exception {
-        // On Android, we can use the following approach to create a self-signed cert:
-        // 1. Use BouncyCastle (not available by default)
-        // 2. Use X509CertImpl from sun.security (Android has this)
-        // 3. Use a pre-generated cert
+    private X509Certificate generateCert(KeyPair keyPair) throws Exception {
+        long now = System.currentTimeMillis();
+        Date notBefore = new Date(now - 365L * 24 * 60 * 60 * 1000);
+        Date notAfter = new Date(now + 365L * 10 * 24 * 60 * 60 * 1000);
+        BigInteger serial = BigInteger.valueOf(now);
+        String issuerStr = "CN=AppCloner Debug";
 
-        // Simplest approach: use Android's built-in certificate generation
-        // via the certificate factory
+        byte[] issuerDer = encodeX500Name(issuerStr);
+        byte[] validityDer = encodeValidity(notBefore, notAfter);
+        byte[] spkiDer = keyPair.getPublic().getEncoded(); // Already full SubjectPublicKeyInfo
 
-        // For Android, we'll use the approach of creating a minimal cert
-        // that apksig will accept
+        // Version [0] EXPLICIT INTEGER(2) for v3
+        byte[] version = encodeTlv(0xA0, encodeInteger(BigInteger.valueOf(2)));
+        byte[] serialNum = encodeInteger(serial);
+        byte[] sigAlg = encodeSequence(encodeOid("1.2.840.113549.1.1.11")); // SHA256withRSA
 
-        // Build a minimal ASN.1 encoded self-signed certificate
-        byte[] certBytes = buildMinimalCert(keyPair);
+        byte[] tbs = encodeSequence(concat(version, serialNum, sigAlg,
+                issuerDer, validityDer, issuerDer, spkiDer));
+
+        // Sign TBSCertificate
+        Signature sig = Signature.getInstance("SHA256withRSA");
+        sig.initSign(keyPair.getPrivate());
+        sig.update(tbs);
+        byte[] signatureValue = sig.sign();
+
+        // Certificate
+        byte[] certDer = encodeSequence(concat(
+                tbs,
+                sigAlg,
+                encodeBitString(signatureValue)
+        ));
 
         java.security.cert.CertificateFactory cf =
                 java.security.cert.CertificateFactory.getInstance("X.509");
-        X509Certificate cert = (X509Certificate) cf.generateCertificate(
-                new ByteArrayInputStream(certBytes));
-
-        return new java.security.cert.Certificate[]{cert};
+        return (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(certDer));
     }
 
-    /**
-     * Builds a minimal self-signed X.509 v3 certificate in DER format
-     */
-    private byte[] buildMinimalCert(KeyPair keyPair) throws Exception {
-        // Use the approach of generating a PKCS12 keystore and extracting the cert
-        // This is the most portable approach across Android versions
-
-        // Alternative: use android.os.Build to check version and use appropriate method
-        // For simplicity, we'll use a pre-encoded minimal cert template
-
-        // Actually, the simplest approach that works on all Android versions:
-        // Use the javax.net.ssl.KeyManagerFactory approach
-
-        // Let's use a different, simpler approach: create a signed APK using
-        // the JCA (Java Cryptography Architecture) directly
-
-        // For now, use the Bouncy Castle light approach if available,
-        // otherwise fall back to a pre-built test certificate
-
-        // Generate using X509V3CertificateGenerator pattern
-        // via raw ASN.1 DER encoding
-
-        long now = System.currentTimeMillis();
-        java.util.Date notBefore = new java.util.Date(now - 365L * 24 * 60 * 60 * 1000);
-        java.util.Date notAfter = new java.util.Date(now + 365L * 10 * 24 * 60 * 60 * 1000);
-        BigInteger serial = BigInteger.valueOf(now);
-
-        String issuer = "CN=AppCloner Debug";
-
-        // Build DER-encoded TBSCertificate
-        // This is complex but necessary for proper Android compatibility
-
-        // Let's use a much simpler approach: use the KeyStore setCertificateEntry
-        // which internally creates a self-signed cert on some Android versions
-
-        // Simplest working approach: use X509CertImpl if available
-        try {
-            // Try to use Android's internal certificate generation
-            Class<?> certClass = Class.forName("sun.security.x509.X509CertImpl");
-            // This class might not be available, so we need a fallback
-        } catch (ClassNotFoundException e) {
-            // Fallback: use a test certificate from the apksig test resources
-        }
-
-        // Use a hardcoded minimal valid self-signed certificate for debug purposes
-        // This is a standard Android debug certificate format
-        return getDebugCertificate(keyPair, serial, notBefore, notAfter, issuer);
-    }
-
-    /**
-     * Returns a debug certificate. Uses reflection to access Android's
-     * internal certificate generation, or a pre-built certificate.
-     */
-    private byte[] getDebugCertificate(KeyPair keyPair, BigInteger serial,
-                                         java.util.Date notBefore, java.util.Date notAfter,
-                                         String issuer) throws Exception {
-        // Try to generate using Android's internal API
-        try {
-            // sun.security.x509.X509CertInfo is available on Android runtime
-            Object certInfo = Class.forName("sun.security.x509.X509CertInfo").newInstance();
-
-            // Set version
-            Object version = Class.forName("sun.security.x509.CertificateVersion")
-                    .getConstructor(int.class).newInstance(2); // v3
-            setField(certInfo, "version", version);
-
-            // Set serial number
-            Object serialNum = Class.forName("sun.security.x509.CertificateSerialNumber")
-                    .getConstructor(BigInteger.class).newInstance(serial);
-            setField(certInfo, "serialNumber", serialNum);
-
-            // Set validity
-            Object validity = Class.forName("sun.security.x509.CertificateValidity")
-                    .getConstructor(java.util.Date.class, java.util.Date.class)
-                    .newInstance(notBefore, notAfter);
-            setField(certInfo, "validity", validity);
-
-            // Set subject and issuer (same for self-signed)
-            Object x500Name = Class.forName("sun.security.x509.X500Name")
-                    .getConstructor(String.class).newInstance(issuer);
-            setField(certInfo, "subject", x500Name);
-            setField(certInfo, "issuer", x500Name);
-
-            // Set public key
-            setField(certInfo, "key", Class.forName("sun.security.x509.CertificateX509Key")
-                    .getConstructor(java.security.PublicKey.class)
-                    .newInstance(keyPair.getPublic()));
-
-            // Set algorithm
-            setField(certInfo, "algorithmId", Class.forName("sun.security.x509.CertificateAlgorithmId")
-                    .getConstructor(Class.forName("sun.security.x509.AlgorithmId"))
-                    .newInstance(Class.forName("sun.security.x509.AlgorithmId")
-                            .getMethod("get", String.class).invoke(null, "SHA256withRSA")));
-
-            // Create the certificate
-            Object certImpl = Class.forName("sun.security.x509.X509CertImpl")
-                    .getConstructor(certInfo.getClass())
-                    .newInstance(certInfo);
-
-            // Sign it
-            java.security.Signature sig = java.security.Signature.getInstance("SHA256withRSA");
-            sig.initSign(keyPair.getPrivate());
-            // sign and encode
-            certImpl.getClass().getMethod("sign", java.security.PrivateKey.class, String.class)
-                    .invoke(certImpl, keyPair.getPrivate(), "SHA256withRSA");
-
-            // Get encoded form
-            return (byte[]) certImpl.getClass().getMethod("getEncoded").invoke(certImpl);
-
-        } catch (Exception e) {
-            Log.w(TAG, "Could not generate cert via sun.security, using fallback: " + e.getMessage());
-            return generateFallbackCert(keyPair, serial, notBefore, notAfter);
-        }
-    }
-
-    private void setField(Object obj, String fieldName, Object value) throws Exception {
-        try {
-            java.lang.reflect.Field field = obj.getClass().getDeclaredField(fieldName);
-            field.setAccessible(true);
-            field.set(obj, value);
-        } catch (NoSuchFieldException e) {
-            // Some versions use different field names, skip
-            Log.d(TAG, "Field not found: " + fieldName);
-        }
-    }
-
-    /**
-     * Fallback: build a raw DER-encoded self-signed X.509v3 certificate
-     */
-    private byte[] generateFallbackCert(KeyPair keyPair, BigInteger serial,
-                                          java.util.Date notBefore, java.util.Date notAfter) throws Exception {
-        // Build a minimal valid X.509 v3 certificate via raw ASN.1 DER encoding
-        // This is verbose but guaranteed to work on any JRE
-
-        byte[] issuerDer = encodeX500Name("CN=AppCloner Debug");
-        byte[] validityDer = encodeValidity(notBefore, notAfter);
-        byte[] spkiDer = encodeSubjectPublicKeyInfo(keyPair.getPublic());
-        byte[] tbs = encodeTbsCertificate(serial, issuerDer, validityDer, issuerDer, spkiDer);
-
-        // Sign the TBSCertificate
-        java.security.Signature sig = java.security.Signature.getInstance("SHA256withRSA");
-        sig.initSign(keyPair.getPrivate());
-        sig.update(tbs);
-        byte[] signature = sig.sign();
-
-        byte[] sigAlgDer = encodeAlgorithmIdentifier("1.2.840.113549.1.1.11"); // SHA256withRSA
-        byte[] sigValueDer = encodeBitString(signature);
-
-        // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
-        return encodeSequence(concat(tbs, sigAlgDer, sigValueDer));
-    }
-
-    // --- Minimal ASN.1 DER encoding helpers ---
+    // --- ASN.1 DER helpers ---
 
     private byte[] encodeSequence(byte[] content) {
         return encodeTlv(0x30, content);
@@ -488,20 +474,18 @@ public class ArsclibApkCloner {
     }
 
     private byte[] encodeInteger(BigInteger value) {
-        byte[] bytes = value.toByteArray();
-        return encodeTlv(0x02, bytes);
+        return encodeTlv(0x02, value.toByteArray());
     }
 
-    private byte[] encodeObjectIdentifier(String oid) {
+    private byte[] encodeOid(String oid) {
         String[] parts = oid.split("\\.");
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
         out.write(Integer.parseInt(parts[0]) * 40 + Integer.parseInt(parts[1]));
         for (int i = 2; i < parts.length; i++) {
             long v = Long.parseLong(parts[i]);
             if (v < 0x80) {
                 out.write((int) v);
             } else {
-                // Encode multi-byte
                 int[] bytes = new int[8];
                 int pos = 0;
                 bytes[pos++] = (int) (v & 0x7F);
@@ -523,9 +507,8 @@ public class ArsclibApkCloner {
     }
 
     private byte[] encodeBitString(byte[] data) {
-        // BIT STRING with 0 unused bits
         byte[] content = new byte[data.length + 1];
-        content[0] = 0; // 0 unused bits
+        content[0] = 0;
         System.arraycopy(data, 0, content, 1, data.length);
         return encodeTlv(0x03, content);
     }
@@ -534,48 +517,22 @@ public class ArsclibApkCloner {
         return encodeTlv(0x0C, str.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
-    private byte[] encodeUtcTime(java.util.Date date) {
-        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyMMddHHmmss'Z'",
-                java.util.Locale.US);
+    private byte[] encodeUtcTime(Date date) {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyMMddHHmmss'Z'", Locale.US);
         sdf.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
         return encodeTlv(0x17, sdf.format(date).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
     }
 
-    private byte[] encodeAlgorithmIdentifier(String oid) {
-        return encodeSequence(encodeObjectIdentifier(oid));
-    }
-
     private byte[] encodeX500Name(String dn) {
-        // CN=AppCloner Debug -> SEQUENCE { SET { SEQUENCE { OID(2.5.4.3), UTF8String } } }
         String cn = dn.replace("CN=", "");
-        byte[] attrType = encodeObjectIdentifier("2.5.4.3"); // CN
+        byte[] attrType = encodeOid("2.5.4.3");
         byte[] attrValue = encodeUtf8String(cn);
         byte[] attr = encodeSequence(concat(attrType, attrValue));
-        byte[] set = encodeSet(attr);
-        return encodeSequence(set);
+        return encodeSequence(encodeSet(attr));
     }
 
-    private byte[] encodeValidity(java.util.Date notBefore, java.util.Date notAfter) {
+    private byte[] encodeValidity(Date notBefore, Date notAfter) {
         return encodeSequence(concat(encodeUtcTime(notBefore), encodeUtcTime(notAfter)));
-    }
-
-    private byte[] encodeSubjectPublicKeyInfo(java.security.PublicKey publicKey) throws Exception {
-        byte[] algId = encodeAlgorithmIdentifier("1.2.840.113549.1.1.1"); // RSA
-        byte[] pubKeyBits = encodeBitString(publicKey.getEncoded());
-        // The public key encoded is already SubjectPublicKeyInfo, extract the key part
-        // Actually publicKey.getEncoded() returns full SubjectPublicKeyInfo
-        // So we just wrap it in a sequence manually
-        return publicKey.getEncoded(); // This is already the full SPKI DER
-    }
-
-    private byte[] encodeTbsCertificate(BigInteger serial, byte[] issuer, byte[] validity,
-                                          byte[] subject, byte[] spki) {
-        // Version [0] EXPLICIT INTEGER (2) for v3
-        byte[] version = encodeTlv(0xA0, encodeInteger(BigInteger.valueOf(2)));
-        byte[] serialNum = encodeInteger(serial);
-        byte[] sigAlg = encodeAlgorithmIdentifier("1.2.840.113549.1.1.11"); // SHA256withRSA
-
-        return encodeSequence(concat(version, serialNum, sigAlg, issuer, validity, subject, spki));
     }
 
     private byte[] concat(byte[]... arrays) {
@@ -589,6 +546,8 @@ public class ArsclibApkCloner {
         }
         return result;
     }
+
+    // --- Utility methods ---
 
     public boolean installApk(String apkPath) {
         try {
@@ -640,21 +599,15 @@ public class ArsclibApkCloner {
         }
     }
 
-    public File getOutputDir() {
-        return outputDir;
-    }
+    public File getOutputDir() { return outputDir; }
 
-    public void cleanup() {
-        deleteRecursive(tempDir);
-    }
+    public void cleanup() { deleteRecursive(tempDir); }
 
     private void deleteRecursive(File file) {
         if (file.isDirectory()) {
             File[] children = file.listFiles();
             if (children != null) {
-                for (File child : children) {
-                    deleteRecursive(child);
-                }
+                for (File child : children) deleteRecursive(child);
             }
         }
         file.delete();

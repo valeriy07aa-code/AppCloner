@@ -39,7 +39,4 @@ dependencies {
 
     // ARSCLib - Android resource manipulation (binary XML, resources)
     implementation 'io.github.reandroid:ARSCLib:1.3.5'
-
-    // APK signing
-    implementation 'com.android.tools.build:apksig:8.2.0'
 }
