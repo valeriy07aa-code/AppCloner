@@ -178,8 +178,15 @@ public class ArsclibApkCloner {
      * Rebuilds APK, replacing manifest and stripping old META-INF/
      */
     private boolean rebuildApk(String inputPath, String outputPath, byte[] modifiedManifest) {
+        Log.d(TAG, "Rebuilding APK: " + inputPath + " -> " + outputPath);
+        int entryCount = 0;
+        int skippedCount = 0;
+
         try (ZipInputStream zis = new ZipInputStream(new FileInputStream(inputPath));
              ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outputPath))) {
+
+            // Use DEFLATED method for all entries to avoid STORED size/CRC issues
+            zos.setLevel(ZipOutputStream.DEFLATED);
 
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
@@ -187,14 +194,20 @@ public class ArsclibApkCloner {
 
                 // Skip old signature
                 if (name.startsWith("META-INF/")) {
+                    skippedCount++;
                     continue;
                 }
 
+                entryCount++;
                 ZipEntry newEntry = new ZipEntry(name);
-                newEntry.setMethod(entry.getMethod());
+                // Always use DEFLATED to avoid needing exact size/CRC for STORED entries
+                newEntry.setMethod(ZipEntry.DEFLATED);
+
                 zos.putNextEntry(newEntry);
 
                 if (name.equals("AndroidManifest.xml")) {
+                    Log.d(TAG, "Replacing manifest: orig=" + entry.getSize()
+                            + " new=" + modifiedManifest.length);
                     zos.write(modifiedManifest);
                 } else {
                     byte[] buf = new byte[8192];
@@ -207,9 +220,11 @@ public class ArsclibApkCloner {
             }
 
             zos.finish();
+            zos.flush();
+            Log.d(TAG, "Rebuild done: " + entryCount + " entries, " + skippedCount + " skipped");
             return true;
-        } catch (IOException e) {
-            Log.e(TAG, "Error rebuilding APK", e);
+        } catch (Exception e) {
+            Log.e(TAG, "Error rebuilding APK at entry " + entryCount, e);
             return false;
         }
     }
@@ -220,26 +235,29 @@ public class ArsclibApkCloner {
      */
     private boolean signApkV1(String inputPath, String outputPath) {
         try {
+            Log.d(TAG, "Signing APK: " + inputPath);
+
             // Generate signing key
             KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
             keyGen.initialize(2048);
             KeyPair keyPair = keyGen.generateKeyPair();
             PrivateKey privateKey = keyPair.getPrivate();
+            Log.d(TAG, "Generated RSA key pair");
 
             // Generate self-signed certificate
             X509Certificate cert = generateCert(keyPair);
+            Log.d(TAG, "Generated certificate: " + cert.getSubjectDN());
 
             // Read all entries from unsigned APK
             Map<String, byte[]> entries = new HashMap<>();
-            Map<String, ZipEntry> entryMeta = new HashMap<>();
             try (ZipInputStream zis = new ZipInputStream(new FileInputStream(inputPath))) {
                 ZipEntry entry;
                 while ((entry = zis.getNextEntry()) != null) {
                     String name = entry.getName();
                     entries.put(name, readAllBytes(zis));
-                    entryMeta.put(name, entry);
                 }
             }
+            Log.d(TAG, "Read " + entries.size() + " entries from unsigned APK");
 
             // Calculate SHA-1 digests for all entries
             MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
@@ -313,10 +331,12 @@ public class ArsclibApkCloner {
             sig.update(sfBytes);
             byte[] signatureBytes = sig.sign();
 
-            // Build PKCS#7 signed data
+            Log.d(TAG, "Building PKCS#7 signature...");
             byte[] pkcs7 = buildPkcs7(sfBytes, signatureBytes, cert);
+            Log.d(TAG, "PKCS#7 size: " + pkcs7.length + " bytes");
 
             // Write signed APK
+            Log.d(TAG, "Writing signed APK...");
             try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outputPath))) {
                 // Write all original entries
                 for (Map.Entry<String, byte[]> e : entries.entrySet()) {
@@ -344,10 +364,12 @@ public class ArsclibApkCloner {
                 zos.finish();
             }
 
+            File outFile = new File(outputPath);
+            Log.d(TAG, "Signed APK written: " + outFile.length() + " bytes");
             return true;
 
         } catch (Exception e) {
-            Log.e(TAG, "Error signing APK", e);
+            Log.e(TAG, "Error signing APK: " + e.getClass().getSimpleName() + ": " + e.getMessage(), e);
             return false;
         }
     }
