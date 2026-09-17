@@ -122,7 +122,7 @@ public class ArsclibApkCloner {
 
             // Parse manifest with ARSCLib
             AndroidManifestBlock manifestBlock = new AndroidManifestBlock();
-            manifestBlock.readBytes(manifestData);
+            manifestBlock.readBytes(new ByteArrayInputStream(manifestData));
 
             // Get original package name
             String originalPackage = manifestBlock.getPackageName();
