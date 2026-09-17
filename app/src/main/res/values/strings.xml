@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AppCloner</string>
+    <string name="search_hint">Поиск приложений…</string>
+    <string name="clone_button">Клонировать</string>
+    <string name="cloning">Клонирование…</string>
+    <string name="clone_success">Приложение успешно клонировано!</string>
+    <string name="clone_error">Ошибка клонирования</string>
+    <string name="no_apps">Приложения не найдены</string>
+    <string name="installing">Установка…</string>
+    <string name="install_success">Клон установлен!</string>
+    <string name="install_error">Ошибка установки</string>
+    <string name="select_app">Выберите приложение</string>
+    <string name="app_info">Информация</string>
+    <string name="version">Версия: %s</string>
+    <string name="package_name">Пакет: %s</string>
+</resources>
