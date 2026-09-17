@@ -294,12 +294,12 @@ public class MainActivity extends AppCompatActivity {
                         .setNegativeButton("Нет", null)
                         .show();
             } else {
+                String errorDetail = apkCloner.getLastError();
+                if (errorDetail == null) errorDetail = "Неизвестная ошибка";
+
                 new MaterialAlertDialogBuilder(MainActivity.this)
-                        .setTitle("Ошибка")
-                        .setMessage("Не удалось клонировать APK.\n\n" +
-                                "Возможные причины:\n" +
-                                "• Приложение использует защиту\n" +
-                                "• Недостаточно места на устройстве")
+                        .setTitle("Ошибка клонирования")
+                        .setMessage(errorDetail)
                         .setPositiveButton("OK", null)
                         .show();
             }

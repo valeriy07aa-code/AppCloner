@@ -56,6 +56,7 @@ public class ArsclibApkCloner {
     private Context context;
     private File outputDir;
     private File tempDir;
+    private String lastError;
 
     public ArsclibApkCloner(Context context) {
         this.context = context;
@@ -93,12 +94,15 @@ public class ArsclibApkCloner {
     }
 
     public String cloneWithNewPackage(String packageName, String newPackageName) {
+        lastError = null;
         try {
             String sourcePath = getApkPath(packageName);
             if (sourcePath == null) {
-                Log.e(TAG, "Source APK not found");
+                lastError = "APK не найден: " + packageName;
+                Log.e(TAG, lastError);
                 return null;
             }
+            Log.d(TAG, "Source APK: " + sourcePath);
 
             String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault())
                     .format(new Date());
@@ -109,9 +113,11 @@ public class ArsclibApkCloner {
             // Step 1: Modify manifest
             byte[] manifestData = extractManifest(sourcePath);
             if (manifestData == null) {
-                Log.e(TAG, "Failed to extract manifest");
+                lastError = "Не удалось извлечь AndroidManifest.xml";
+                Log.e(TAG, lastError);
                 return null;
             }
+            Log.d(TAG, "Manifest size: " + manifestData.length + " bytes");
 
             AndroidManifestBlock manifestBlock = new AndroidManifestBlock();
             manifestBlock.readBytes(new ByteArrayInputStream(manifestData));
@@ -121,29 +127,35 @@ public class ArsclibApkCloner {
 
             manifestBlock.setPackageName(newPackageName);
             byte[] modifiedManifest = manifestBlock.getBytes();
+            Log.d(TAG, "Modified manifest size: " + modifiedManifest.length + " bytes");
 
             // Step 2: Rebuild APK without old signature
             boolean rebuilt = rebuildApk(sourcePath, unsignedFile.getAbsolutePath(),
                     modifiedManifest);
             if (!rebuilt) {
-                Log.e(TAG, "Failed to rebuild APK");
+                lastError = "Ошибка пересборки APK";
+                Log.e(TAG, lastError);
                 return null;
             }
+            Log.d(TAG, "Unsigned APK size: " + unsignedFile.length());
 
             // Step 3: Sign APK (v1 JAR signing)
             boolean signed = signApkV1(unsignedFile.getAbsolutePath(),
                     signedFile.getAbsolutePath());
             if (!signed) {
-                Log.e(TAG, "Failed to sign APK");
+                lastError = "Ошибка подписи APK (v1 JAR signing failed)";
+                Log.e(TAG, lastError);
                 return null;
             }
 
             unsignedFile.delete();
-            Log.i(TAG, "APK cloned: " + signedFile.getAbsolutePath());
+            Log.i(TAG, "APK cloned: " + signedFile.getAbsolutePath()
+                    + " (" + signedFile.length() + " bytes)");
             return signedFile.getAbsolutePath();
 
         } catch (Exception e) {
-            Log.e(TAG, "Error cloning APK", e);
+            lastError = "Исключение: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+            Log.e(TAG, lastError, e);
             return null;
         }
     }
@@ -600,6 +612,8 @@ public class ArsclibApkCloner {
     }
 
     public File getOutputDir() { return outputDir; }
+
+    public String getLastError() { return lastError; }
 
     public void cleanup() { deleteRecursive(tempDir); }
 
